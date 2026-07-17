@@ -1,13 +1,24 @@
 // 하루한장 — 일정 알림 발송 Edge Function.
 // pg_cron으로 1분마다 호출되어, 지금 발송해야 할 알림을 찾아 Web Push로 보낸다.
 //
+// 배포: supabase functions deploy send-reminders --no-verify-jwt
+//   (최신 Supabase 프로젝트의 publishable/secret 키 체계와 무관하게 동작하도록,
+//    Supabase 기본 JWT 검증 대신 아래 CRON_SECRET으로 직접 인증한다)
+//
 // 필요한 환경변수(secrets):
 //   VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT (예: mailto:you@example.com)
+//   CRON_SECRET — pg_cron이 보내는 Authorization: Bearer 값과 대조할 임의의 비밀값
 // SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY 는 Supabase가 자동으로 주입한다.
 //
 // 시간대: 이 앱은 한국 사용자를 대상으로 하므로 일정 날짜/시간을 KST(UTC+9) 고정으로
 // 해석한다. 사용자별 시간대를 저장하지 않으므로, 해외에서 접속하는 사용자가 있다면
 // 이 부분을 planner_state에 시간대를 추가로 저장하도록 확장해야 한다.
+//
+// 프라이버시 참고: 이 함수는 service_role 권한으로 "모든" 사용자의 planner_state를
+// 읽어 알림 시각을 계산한다(관리자 승인이 끝난 사용자만). 앱 자체는 관리자도 남의
+// 일정을 볼 수 없게 설계돼 있지만, 알림을 정해진 시각에 보내려면 서버(이 함수) 쪽에서는
+// 불가피하게 전체를 스캔해야 한다 — 사람이 열람하는 것이 아니라 자동화된 시각 비교만
+// 수행한다는 점을 참고하세요.
 
 import { createClient } from "npm:@supabase/supabase-js@2";
 import webpush from "npm:web-push@3.6.7";
@@ -17,6 +28,7 @@ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const VAPID_PUBLIC_KEY = Deno.env.get("VAPID_PUBLIC_KEY")!;
 const VAPID_PRIVATE_KEY = Deno.env.get("VAPID_PRIVATE_KEY")!;
 const VAPID_SUBJECT = Deno.env.get("VAPID_SUBJECT") || "mailto:example@example.com";
+const CRON_SECRET = Deno.env.get("CRON_SECRET");
 
 webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
@@ -57,9 +69,22 @@ interface DueItem {
   timeStr: string;
 }
 
-Deno.serve(async (_req) => {
+Deno.serve(async (req) => {
+  if (CRON_SECRET) {
+    const auth = req.headers.get("Authorization") || "";
+    if (auth !== `Bearer ${CRON_SECRET}`) {
+      return json({ error: "unauthorized" }, 401);
+    }
+  }
   try {
     const nowMinute = Math.floor(Date.now() / 60000);
+
+    const { data: approvedProfiles, error: profileErr } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("approved", true);
+    if (profileErr) throw profileErr;
+    const approvedIds = new Set((approvedProfiles ?? []).map((p) => p.id));
 
     const { data: rows, error } = await supabase
       .from("planner_state")
@@ -68,6 +93,7 @@ Deno.serve(async (_req) => {
 
     const due: DueItem[] = [];
     for (const row of rows ?? []) {
+      if (!approvedIds.has(row.user_id)) continue;
       const events = row?.data?.events;
       if (!events || typeof events !== "object") continue;
       for (const dateStr of Object.keys(events)) {
